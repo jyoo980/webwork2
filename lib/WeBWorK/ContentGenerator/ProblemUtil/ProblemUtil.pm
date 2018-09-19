@@ -43,6 +43,7 @@ use WeBWorK::Utils qw(readFile writeLog writeCourseLog encodeAnswers decodeAnswe
 use WeBWorK::DB::Utils qw(global2user user2global);
 use URI::Escape;
 use WeBWorK::Authen::LTIAdvanced::SubmitGrade;
+use WeBWorK::Authen::LTIAdvantage::AssignmentAndGradeService;
 use WeBWorK::Utils::Tasks qw(fake_set fake_problem);
 
 use Email::Simple;
@@ -296,6 +297,15 @@ sub process_and_log_answer{
 				      $scoreRecordedMessage .= $r->maketext("Your score was not successfully sent to the LMS");
 				    }
 				  }
+				}
+				if ($self->{ce}->{bridge}{push_grades_on_submit}) {
+					my $assignment_and_grades_service = WeBWorK::Authen::LTIAdvantage::AssignmentAndGradeService->new($self->{ce}, $db);
+					my $ret = $assignment_and_grades_service->pushUserGradesOnSubmit($problem->user_id, $problem->set_id);
+					if ($ret) {
+						$scoreRecordedMessage .= $r->maketext(" Your score was not successfully sent to the LMS");
+					} else {
+						$scoreRecordedMessage .= $r->maketext(" Your score was successfully sent to the LMS");
+					}
 				}
 
 			} else {

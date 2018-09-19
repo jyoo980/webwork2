@@ -12,17 +12,17 @@ use Date::Format;
 use WeBWorK::CourseEnvironment;
 
 # Constructor
-sub new 
+sub new
 {
-	my ($class, $r) = @_;
+	my ($class, $ce) = @_;
 	my $self = {
-		r => $r
+		ce => $ce
 	};
 	bless $self, $class;
 	return $self;
 }
 
-sub logXML
+sub logLTIRequest
 {
 	my ($self, $xml) = @_;
 	my ($sec, $msec) = gettimeofday;
@@ -30,7 +30,7 @@ sub logXML
 
 	my $msg = "[$date] $xml\n";
 
-	my $logfile = $self->{r}->ce->{webworkDirs}{logs} . "/lti_xml.log";
+	my $logfile = $self->{ce}->{webworkDirs}{logs} . "/lti_request.log";
 	if (open my $f, ">>", $logfile)
 	{
 		print $f $msg;

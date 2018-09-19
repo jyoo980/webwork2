@@ -11,7 +11,7 @@ use WeBWorK::Utils qw(runtime_use);
 use WebworkBridge::Importer::Error;
 
 # Constructor
-sub new 
+sub new
 {
 	my ($class, $r) = @_;
 	my $self = {
@@ -44,16 +44,13 @@ sub run
 	}
 
 	if ($bridge->accept())
-	{ 
+	{
 		debug("Compatible bridge found!");
 		$self->{bridge} = $bridge;
 		return $bridge->run();
 	}
-	else
-	{ # could've ended the loop without finding a compatible bridge
-		debug("No compatible bridge found...");
-		return error("Failed to find a compatible bridge.", "#e002");
-	}
+	# could've ended the loop without finding a compatible bridge
+	return 0;
 }
 
 sub useAuthenModule
@@ -63,13 +60,6 @@ sub useAuthenModule
 	return $bridge ? $bridge->useAuthenModule() : "";
 }
 
-sub useDisplayModule
-{
-	my ($self) = @_;
-	my $bridge = $self->{bridge};
-	return $bridge ? $bridge->useDisplayModule() : "";
-}
-
 sub getAuthenModule
 {
 	my ($self) = @_;
@@ -77,11 +67,11 @@ sub getAuthenModule
 	return $bridge ? $bridge->getAuthenModule() : "";
 }
 
-sub getDisplayModule
+sub getErrorDisplayModule
 {
 	my ($self) = @_;
 	my $bridge = $self->{bridge};
-	return $bridge ? $bridge->getDisplayModule() : "";
+	return $bridge ? $bridge->getErrorDisplayModule() : "";
 }
 
 1;

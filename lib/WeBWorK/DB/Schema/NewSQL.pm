@@ -167,6 +167,18 @@ sub where_automatic_updates_eq {
     return {automatic_updates=>$automatic_update};
 }
 
+# can be used for lti_resource_link
+sub where_deployment_id_and_context_id_eq {
+    my ($self, $flags, $deployment_id, $context_id) = @_;
+    return { deployment_id=>$deployment_id, context_id=>$context_id };
+}
+
+# can be used for lti_resource_link
+sub where_context_id_eq {
+    my ($self, $flags, $context_id) = @_;
+    return {};
+}
+
 # added where clauses for locations and set_locations
 
 sub where_location_id_eq { 

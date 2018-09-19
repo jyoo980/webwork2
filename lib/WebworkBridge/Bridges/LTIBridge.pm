@@ -6,27 +6,37 @@ use strict;
 use warnings;
 
 use Net::OAuth;
+use Net::OAuth::ConsumerRequest;
 use HTTP::Request::Common;
 use LWP::UserAgent;
 use Data::Dumper;
+use JSON;
+use Digest::SHA qw(sha1_base64);;
+use MIME::Base64;
+use URI::Escape qw(uri_escape);
+use CGI;
 
 use WeBWorK::CourseEnvironment;
 use WeBWorK::DB;
 use WeBWorK::Debug;
 
-use WebworkBridge::Exporter::GradesExport;
 use WebworkBridge::Importer::Error;
-use WebworkBridge::Parser;
-use WebworkBridge::Bridges::LTIParser;
+use WeBWorK::Authen::LTIAdvantage::LTILaunchParser;
 use WebworkBridge::ExtraLog;
 
-use WeBWorK::Authen::LTI;
+use WeBWorK::Authen::LTIAdvantage;
+use WeBWorK::Authen::LTIAdvantage::NamesAndRoleService;
+use WeBWorK::Authen::LTIAdvantage::AssignmentAndGradeService;
+
+$WeBWorK::Debug::Enabled = 1;
 
 # Constructor
 sub new
 {
 	my ($class, $r) = @_;
 	my $self = $class->SUPER::new($r);
+	my $ce = $r->ce;
+	$self->{parser} = WeBWorK::Authen::LTIAdvantage::LTILaunchParser->new($ce, $r->param("id_token"));
 	bless $self, $class;
 	return $self;
 }
@@ -36,8 +46,7 @@ sub accept
 	my $self = shift;
 	my $r = $self->{r};
 
-	if ($r->param("lti_message_type"))
-	{
+	if ($r->param("id_token")) {
 		return 1;
 	}
 
@@ -60,114 +69,121 @@ sub run
 	my $ce = $r->ce;
 	$r->{db} = new WeBWorK::DB($ce->{dbLayout});
 	my $db = $r->db;
+	my $parser = $self->{parser};
+
+	if ($parser->{error}) {
+		debug("parser error: ". $parser->{error});
+		my $error_message = CGI::h2("LTI Launch Failed");
+		if ($parser->{error} =~ m/^JWT: exp claim check failed/) {
+			$error_message .= CGI::div({class=>"ResultsWithError"}, CGI::pre("Your launch request has expired. Please click on the LTI link again.") );
+		} else {
+			$error_message .= CGI::p("Unfortunately, the LTI launch failed. This might be a temporary condition. If it persists, please mail an error report with the time that the error occured and the exact error message below:");
+			$error_message .= CGI::div({class=>"ResultsWithError"}, CGI::pre($parser->{error}) );
+		}
+		return $error_message;
+	}
 
 	# check if user wants to go directly to an assignment
-	my $hwset = $r->param("custom_homework_set");
+	my $hwset = $parser->get_claim_param("custom", "homework_set");
 	if ($hwset)
 	{
 		# not perfect sanitization, but need something
-		$hwset = WebworkBridge::Parser::sanitizeCourseName($hwset);
+		$hwset = $parser->sanitizeCourseName($hwset);
 		$self->{homeworkSet} = $hwset;
 	}
-	my $qset = $r->param("custom_quiz_set");
+	my $qset = $parser->get_claim_param("custom", "quiz_set");
 	if ($qset)
 	{
 		# not perfect sanitization, but need something
-		$qset = WebworkBridge::Parser::sanitizeCourseName($qset);
+		$qset = $parser->sanitizeCourseName($qset);
 		$self->{quizSet} = $qset;
 	}
 
-	my $parser = WebworkBridge::Bridges::LTIParser->new($r);
-	my $oauth_consumer_key = $r->param('oauth_consumer_key');
-	my $context_id = $r->param('context_id');
-	my $courseID = $parser->getCourseName();
+	my $deployment_id = $parser->get_claim("deployment_id");
+	my $context_id = $parser->get_claim_param("context", "id");
+	my $course_id = $parser->getCourseName();
 
 	# LTI processing
-	if ($r->param("lti_message_type") && $oauth_consumer_key && $context_id && $courseID)
+	if ($deployment_id && $context_id && $course_id)
 	{
 		debug("LTI detected\n");
 
+		# verify message
+		my $ret = $self->_verifyMessage();
+		if ($ret) {
+			debug("_verifyMessage error: ". $ret);
+			my $error_message = CGI::h2("LTI Launch Failed");
+			$error_message .= CGI::p("Unfortunately, the LTI launch failed. This might be a temporary condition. If it persists, please mail an error report with the time that the error occured and the exact error message below:");
+			$error_message .= CGI::div({class=>"ResultsWithError"}, CGI::pre($ret) );
+			return $error_message;
+		}
+
 		# Check for course existence
-		if($db->existsLTIContext($oauth_consumer_key, $context_id)) {
-        	my $lti_context = $db->getLTIContext($oauth_consumer_key, $context_id);
+		if($db->existsLTIContext($deployment_id, $context_id)) {
+        	my $lti_context = $db->getLTIContext($deployment_id, $context_id);
 			# over write course id with value stored in context table
-			$courseID = $lti_context->course_id();
+			$course_id = $lti_context->course_id();
 		}
 
 		# setup tmp course ce and db
 		my $tmpce = WeBWorK::CourseEnvironment->new({
 			%WeBWorK::SeedCE,
-			courseName => $courseID
+			courseName => $course_id,
+			apache_hostname => $ce->{apache_hostname},
+			apache_port => $ce->{apache_port},
+			apache_is_ssl => $ce->{apache_is_ssl},
+			apache_root_url => $ce->{apache_root_url},
 		});
+
+		# set request ce and db to courseID
+		$r->{ce} = $tmpce;
+		$r->{db} = new WeBWorK::DB($r->ce->{dbLayout});
+
+		# direct the student directly to a homework assignment or quiz if needed
+		my $redir = $r->uri . $course_id;
+		if ($self->getHomeworkSet()) {
+			$redir .= "/" . $self->getHomeworkSet();
+		} elsif ($self->getQuizSet()) {
+			$redir .= "/quiz_mode/" . $self->getQuizSet();
+		}
 
 		if (-e $tmpce->{courseDirs}->{root}) {
 			# course exists
-			debug("We're trying to authenticate to an existing course.");
-			if ($ce->{"courseName"} && $ce->{"courseName"} ne '___') {
-				debug("CourseID " . $ce->{"courseName"} . " found.");
+			$self->_updateLaunchUser();
 
-				$self->_updateLaunchUser();
-
-				debug("Trying authentication\n");
-				$self->{useAuthenModule} = 1;
-				if (my $tmp = $self->_verifyMessage())
-				{ # LTI OAuth verification failed
-					return $tmp;
-				}
-
-				return $self->updateCourse();
-			} else {
-				debug("CourseID not found, trying workaround\n");
-				# workaround is basically dump all our POST parameters into
-				# GET and redirect to that url. This should work as long as
-				# our url doesn't exceed 2000 characters.
-				use URI::Escape;
-				my @tmp;
-				foreach my $key ($r->param)
-				{
-					my $val = $r->param($key);
-					push(@tmp, "$key=" . uri_escape($val));
-				}
-				my $args = join('&', @tmp);
-
-				# direct the student directly to a homework assignment or quiz
-				# if needed
-				my $redir = $r->uri . $courseID;
-				if ($self->getHomeworkSet())
-				{
-					$redir .= "/" . $self->getHomeworkSet();
-				}
-				elsif ($self->getQuizSet())
-				{
-					$redir .= "/quiz_mode/" . $self->getQuizSet();
-				}
-				$redir .= "/?". $args;
-				debug("Redirecting with url: $redir");
-				use CGI;
-				my $q = CGI->new();
-				print $q->redirect($redir);
+			$ret = $self->updateCourse();
+			if ($ret) {
+				debug("updateCourse error: ". $ret);
+				my $error_message = CGI::h2("LTI Launch Failed");
+				$error_message .= CGI::p("Unfortunately, the LTI launch failed. This might be a temporary condition. If it persists, please mail an error report with the time that the error occured and the exact error message below:");
+				$error_message .= CGI::div({class=>"ResultsWithError"}, CGI::pre($ret) );
+				return $error_message;
 			}
 		} else {
-			# set request ce and db to courseID
-			$r->{ce} = $tmpce;
-			$r->{db} = new WeBWorK::DB($r->ce->{dbLayout});
-
 			# course does not exist
 			debug("Course does not exist, try LTI import.");
-			$self->{useDisplayModule} = 1;
-			if (my $tmp = $self->_verifyMessage())
-			{
-				return $tmp;
+
+			$ret = $self->createCourse();
+			if ($ret) {
+				debug("createCourse error: ". $ret);
+				my $error_message = CGI::h2("LTI Launch Failed");
+				$error_message .= CGI::p("Unfortunately, import failed. This might be a temporary condition. If it persists, please mail an error report with the time that the error occured and the exact error message below:");
+				$error_message .= CGI::div({class=>"ResultsWithError"}, CGI::pre($ret) );
+				return $error_message;
 			}
 
-			return $self->createCourse();
+			my $message = "The course was successfully imported into Webwork.";
+			$redir .= "?status_message=".uri_escape(CGI::div({class=>"ResultsWithoutError"}, $message));
 		}
-	}
-	else
-	{
-		debug("LTI detected but unable to proceed, missing parameter 'context_title'.\n");
+
+		# ensure authentification module is used
+		$self->{useAuthenModule} = 1;
+
+		my $q = CGI->new();
+		print $q->redirect($redir);
 	}
 
+	return 0;
 }
 
 sub getAuthenModule
@@ -182,29 +198,27 @@ sub createCourse
 	my $self = shift;
 	my $r = $self->{r};
 	my $ce = $r->ce;
+	my $db = $r->db;
+	my $parser = $self->{parser};
 
-	if (!$self->_isInstructor())
-	{
+	my $permissions = $parser->get_permissions();
+	if ($permissions < $ce->{userRoles}{professor}) {
 		return error("Please ask your instructor to import this course into Webworks first.", "#e011");
 	}
 
-	my %course = ();
-	my @users = ();
-
-	my $ret = $self->_getAndParseRoster(\%course, \@users);
-	if ($ret)
-	{
-		return error("Get roster failed: $ret", "#e009");
-	}
-
-	$ret = $self->SUPER::createCourse(\%course, \@users);
-	if ($ret)
-	{
+	my $ret = $self->SUPER::createCourse($parser->getCourseName(), $parser->get_claim_param("context", "title"));
+	if ($ret) {
 		return error("Create course failed: $ret", "#e010");
 	}
 
 	# store LTI credentials for auto-update
-	$self->updateLTISettings();
+	$self->_updateLTISettings();
+
+	# add current user to the course
+	$self->_updateLaunchUser();
+
+	# try to update roster if names and role service enabled
+	$self->_updateClassRoster();
 
 	return 0;
 }
@@ -214,417 +228,135 @@ sub updateCourse
 	my $self = shift;
 	my $r = $self->{r};
 	my $ce = $r->ce;
+	my $db = $r->db;
+	my $parser = $self->{parser};
+
+	# store LTI credentials for auto-update
+	$self->_updateLTISettings();
 
 	debug("Checking to see if we can update the course.");
 	# check roles to see if we can run update
-	if (!defined($r->param('roles')))
-	{
+	if (!defined($parser->get_claim("roles"))) {
 		return error("LTI launch missing roles, NOT updating course.", "#e025");
 	}
-	my @roles = split(/,/, $r->param("roles"));
+
+	my @roles = @{$parser->get_claim("roles")};
 	my $allowedUpdate = 0;
-	foreach my $role (@roles)
-	{
-		if ($ce->{bridge}{roles_can_update} =~ /$role/)
-		{
-			debug("Role $role allowed to update course.");
-			$allowedUpdate = 1;
-			last;
+	foreach my $role (@roles) {
+		foreach my $update_role ($ce->{bridge}{roles_can_update}) {
+			if ($update_role eq $role) {
+				debug("Role $role allowed to update course.");
+				$allowedUpdate = 1;
+				last;
+			}
 		}
+		last if ($allowedUpdate);
 	}
 
-	if (!$allowedUpdate)
-	{
+	if (!$allowedUpdate) {
 		debug("User not allowed to update course.");
 		return 0;
 	}
 
-	# store LTI credentials for auto-update
-	$self->updateLTISettings();
-
-	my %course = ();
-	my @users = ();
-
-	# try to update course enrolment
-	my $ret = $self->_updateCourseEnrolment(\%course, \@users);
-	if ($ret)
-	{ # failed to update course enrolment, stop here
-		debug("Course enrolment update failed, bailing.");
-		return $ret;
-	}
+	# try to update roster if names and role service enabled
+	$self->_updateClassRoster();
 
 	# try to push out grades back to the LMS
-	$ret = $self->_pushGrades();
+	if (defined($parser->get_claim_param("custom", "gradesync"))) {
+		return $self->_updateClassGrades();
+	}
 
-	return $ret;
+	return 0;
 }
 
-sub updateLTISettings()
+sub _updateLTISettings()
 {
 	my $self = shift;
 	my $r = $self->{r};
 	my $ce = $r->ce;
 	my $db = $r->db;
+	my $parser = $self->{parser};
 
-	if (defined($r->param('ubc_auto_update'))) {
-		# skip updating settings if automatic update
-		return;
-	}
-
-	my $oauth_consumer_key = $r->param('oauth_consumer_key');
-	my $context_id = $r->param('context_id');
+	my $deployment_id = $parser->get_claim("deployment_id");
+	my $context_id = $parser->get_claim_param("context", "id");
+	my $resource_link_id = $parser->get_claim_param("resource_link", "id");
 
 	my $lti_context;
-	my $exists = $db->existsLTIContext($oauth_consumer_key, $context_id);
+	my $exists = $db->existsLTIContext($deployment_id, $context_id);
 
 	if($exists) {
-        $lti_context = $db->getLTIContext($oauth_consumer_key, $context_id);
+        $lti_context = $db->getLTIContext($deployment_id, $context_id);
     } else {
-        $lti_context = $db->newLTIContext();
-		$lti_context->oauth_consumer_key($oauth_consumer_key);
-		$lti_context->context_id($context_id);
-		# only set course_title and automatic_updates are only set up new lti contexts
-        $lti_context->course_id($ce->{"courseName"});
-        $lti_context->automatic_updates(1);
+        $lti_context = $db->newLTIContext(
+			deployment_id => $deployment_id,
+			context_id => $context_id,
+			# only set course_title and automatic_updates are only set up new lti contexts
+			course_id => $ce->{courseName},
+			automatic_updates => 1
+		);
 	}
-
-	$lti_context->ext_ims_lis_memberships_id($r->param('ext_ims_lis_memberships_id'));
-	$lti_context->ext_ims_lis_memberships_url($r->param('ext_ims_lis_memberships_url'));
-	$lti_context->ext_ims_lis_basic_outcome_url($r->param('ext_ims_lis_basic_outcome_url'));
-	$lti_context->custom_context_memberships_url($r->param('custom_context_memberships_url'));
 
 	if($exists) {
         $db->putLTIContext($lti_context);
     } else {
         $db->addLTIContext($lti_context);
 	}
-}
 
-# Sync course enrolment from the lms with Webwork
-sub _updateCourseEnrolment()
-{
-	my ($self, $course, $users) = @_;
+	# only if resource_link_id is present
+	if ($resource_link_id) {
+		my $lti_resource_link;
+		$exists = $db->existsLTIResourceLink($deployment_id, $context_id, $resource_link_id);
 
-	debug("Trying to update course enrolment.");
-	my $r = $self->{r};
-	unless ($r->param("ext_ims_lis_memberships_url"))
-	{
-		debug("Server does not allow roster retrival.\n");
-		return 0;
-	}
-
-	my $ret = $self->_getAndParseRoster($course, $users);
-	if ($ret)
-	{
-		return error("Get roster failed: $ret", "#e009");
-	}
-
-	if (@$users)
-	{
-		$ret = $self->SUPER::updateCourse($course, $users);
-		if ($ret)
-		{
-			return error("Update course failed: $ret", "#e010");
-		}
-	}
-	return 0;
-}
-
-# Push grades from Webwork to the lms
-sub _pushGrades()
-{
-	my $self = shift;
-	my $r = $self->{r};
-	unless ($r->param("ext_ims_lis_basic_outcome_url"))
-	{
-		debug("Server does not allow outcome submissions.\n");
-		return 0;
-	}
-
-	# ensure that ratio is enabled if ext_ims_lis_resultvalue_sourcedids is sent
-	# if ext_ims_lis_resultvalue_sourcedids is not sent, we must assume it is enabled
-	if (defined($r->param('ext_ims_lis_resultvalue_sourcedids')))
-	{
-		unless ($r->param('ext_ims_lis_resultvalue_sourcedids') =~ /decimal/i)
-		{
-			return error("Grade update failed: no decimal result support.", "#e021");
-		}
-	}
-
-	if (defined($r->param('custom_gradesync')))
-	{
-		my $extralog = WebworkBridge::ExtraLog->new($r);
-		$extralog->logXML("--- " . $r->param('context_title') . " ---");
-		debug("Allowed to do mass grade syncing.");
-
-		my $grades = WebworkBridge::Exporter::GradesExport->new($r);
-		my $scores = $grades->getGrades();
-		while (my ($studentID, $records) = each(%$scores))
-		{
-			$extralog->logXML("Grade Sync for user $studentID");
-			foreach my $record (@$records)
-			{
-				# send all scores, even if it's 0 or the user hasn't attempted it
-				my $ret = $self->_ltiUpdateGrade($record);
-				if ($ret)
-				{
-					error("Grade update failed: $ret", "#e020");
-				}
-			}
-		}
-	}
-
-	return 0;
-}
-
-# Perform the actual LTI request to send a grade to the LMS
-sub _ltiUpdateGrade()
-{
-	my ($self, $record) = @_;
-	my $r = $self->{r};
-	my $ce = $r->ce;
-
-	my $key = $r->param("oauth_consumer_key");
-	my $lis_source_did = $record->{lis_source_did};
-	my $score = $record->{score};
-
-	my $extralog = WebworkBridge::ExtraLog->new($r);
-	$extralog->logXML("fetching score for lis_source_did $lis_source_did");
-
-	# read current score from tool consumer
-	my $read_request = Net::OAuth->request("request token")->new(
-		consumer_key => $key,
-		consumer_secret => $ce->{bridge}{lti_secrets}{$key},
-		protocol_version => Net::OAuth::PROTOCOL_VERSION_1_0A,
-		request_url => $r->param("ext_ims_lis_basic_outcome_url"),
-		request_method => 'POST',
-		signature_method => 'HMAC-SHA1',
-		timestamp => time(),
-		nonce => rand(),
-		callback => 'about:blank',
-		extra_params => {
-			lti_version => 'LTI-1p0',
-			lti_message_type => 'basic-lis-readresult',
-			sourcedid => $lis_source_did,
-		}
-	);
-	$read_request->sign;
-
-	my $ua = LWP::UserAgent->new;
-	push @{ $ua->requests_redirectable }, 'POST';
-
-	my $read_res = $ua->post($r->param("ext_ims_lis_basic_outcome_url"), $read_request->to_hash);
-	if ($read_res->is_success)
-	{
-		debug($read_res->content);
-		$extralog->logXML($read_res->content);
-		if ($read_res->content =~ /codemajor>Failure/i)
-		{
-			$extralog->logXML("Grade read failed for $lis_source_did, unable to authenticate.");
-			return "Grade read failed for $lis_source_did, unable to authenticate.";
-		}
-		elsif ($read_res->content =~ /codeminor>User not found/i)
-		{
-			$extralog->logXML("Grade read failed for $lis_source_did, can't find user.");
-			return "Grade read failed for $lis_source_did, can't find user.";
-		}
-		elsif ($read_res->content =~ /textString>(.*)<\/textString/i) {
-			my $existing_score = sprintf("%.4f", $1);
-			if ("$score" eq $existing_score) {
-				$extralog->logXML("Current Grade ($score) matches Tool Consumer ($existing_score). Update not neccissary.");
-				debug("Grade read successful for $lis_source_did. Update not neccissary.");
-				return "";
-			}
-			else
-			{
-				$extralog->logXML("Current Grade ($score) does not match Tool Consumer ($existing_score). Update neccissary.");
-				debug("Grade read successful for $lis_source_did. Update nessicary. ($existing_score)->($score)");
-				#no return, continue to update grade
-			}
-		}
-		else
-		{
-			# accodring to the spec, textString field is expected even there is no grade. It seems Canvas'
-			# implementation doesn't strictly follow the spec. So we update grade anyway in this case.
-			$extralog->logXML("Grade read error for $lis_source_did. no grade textString returned. Update anyway");
-		}
-	}
-	else
-	{
-		$extralog->logXML("Grade read failed, POST request failed. ". $read_res->message);
-		return "Grade read failed, POST request failed.";
-	}
-
-	$extralog->logXML("Updating score for lis_source_did $lis_source_did to score $score");
-
-	my $request = Net::OAuth->request("request token")->new(
-		consumer_key => $key,
-		consumer_secret => $ce->{bridge}{lti_secrets}{$key},
-		protocol_version => Net::OAuth::PROTOCOL_VERSION_1_0A,
-		request_url => $r->param("ext_ims_lis_basic_outcome_url"),
-		request_method => 'POST',
-		signature_method => 'HMAC-SHA1',
-		timestamp => time(),
-		nonce => rand(),
-		callback => 'about:blank',
-		extra_params => {
-			lti_version => 'LTI-1p0',
-			lti_message_type => 'basic-lis-updateresult',
-			sourcedid => $lis_source_did,
-			result_resultscore_textstring => $score,
-			result_resultvaluesourcedid => 'decimal',
-			# Optional parameters, may not be supported
-			#result_resultscore_language => 'en_US',
-			#result_statusofresult => 'final',
-			#result_date => strftime("%Y-%m-%dT%H:%M:%S", gmtime(time())) . 'Z',
-			#result_datasource => 'blah'
-		}
-	);
-	$request->sign;
-
-	my $res = $ua->post($r->param("ext_ims_lis_basic_outcome_url"), $request->to_hash);
-	if ($res->is_success)
-	{
-		debug($res->content);
-		$extralog->logXML($res->content);
-		if ($res->content =~ /codemajor>Failure/i)
-		{
-			$extralog->logXML("Grade update failed for $lis_source_did, unable to authenticate.");
-			return "Grade update failed for $lis_source_did, unable to authenticate.";
-		}
-		elsif ($res->content =~ /codeminor>User not found/i)
-		{
-			$extralog->logXML("Grade update failed for $lis_source_did, can't find user.");
-			return "Grade update failed for $lis_source_did, can't find user.";
-		}
-		else
-		{
-			$extralog->logXML("Grade update successful for $lis_source_did.");
-			debug("Grade update successful for $lis_source_did.");
-			return "";
-		}
-	}
-	else
-	{
-		$extralog->logXML("Grade update failed, POST request failed. ". $res->message);
-		return "Grade update failed, POST request failed.";
-	}
-}
-
-sub _isInstructor
-{
-	my $self = shift;
-	my $r = $self->{r};
-
-	if ($r->param('roles') =~ /instructor/i ||
-		$r->param('roles') =~ /contentdeveloper/i)
-	{
-		return 1;
-	}
-	return 0;
-}
-
-sub _getAndParseRoster
-{
-	my ($self, $course_ref, $users_ref) = @_;
-	my $r = $self->{r};
-	my $parser = WebworkBridge::Bridges::LTIParser->new($r, $course_ref, $users_ref);
-
-
-	if (defined($r->param("ext_ims_lis_memberships_url")))
-	{
-		my $xml;
-		my $ret = $self->_getRoster(\$xml);
-		if ($ret)
-		{
-			return error("Unable to connect to roster server: $ret", "#e003");
+		if($exists) {
+			$lti_resource_link = $db->getLTIResourceLink($deployment_id, $context_id, $resource_link_id);
+		} else {
+			$lti_resource_link = $db->newLTIResourceLink(
+				deployment_id => $deployment_id,
+				context_id => $context_id,
+				resource_link_id => $resource_link_id,
+			);
 		}
 
-		$ret = $parser->parse($xml);
-		if ($ret)
-		{
-			return error("XML response received, but access denied.", "#e005");
+		if (($self->getHomeworkSet() || $self->getQuizSet())) {
+			my $setId = $self->getHomeworkSet() ? $self->getHomeworkSet() : $self->getQuizSet();
+			$lti_resource_link->set_id($setId);
+		}
+		else {
+			$lti_resource_link->set_id("");
+		}
+
+		my $resource_link_id = $parser->get_claim_param("resource_link", "id");
+
+		if ($parser->get_nrps_claim()) {
+			$lti_resource_link->context_memberships_url($parser->get_nrps_claim_param("context_memberships_url"));
+			$lti_resource_link->context_service_version($parser->get_nrps_claim_param("service_version"));
+		} else {
+			$lti_resource_link->context_memberships_url("");
+			$lti_resource_link->context_service_version("");
+		}
+
+		if ($parser->get_ags_claim()) {
+			$lti_resource_link->lineitems_url($parser->get_ags_claim_param("lineitems"));
+			$lti_resource_link->lineitem_url($parser->get_ags_claim_param("lineitem"));
+			$lti_resource_link->scope_lineitem($parser->has_ags_claim_scope("lineitem"));
+			$lti_resource_link->scope_lineitem_read_only($parser->has_ags_claim_scope("lineitem.readonly"));
+			$lti_resource_link->scope_result_readonly($parser->has_ags_claim_scope("result.readonly"));
+			$lti_resource_link->scope_result_score($parser->has_ags_claim_scope("score"));
+		} else {
+			$lti_resource_link->lineitems_url("");
+			$lti_resource_link->lineitem_url("");
+			$lti_resource_link->scope_lineitem("");
+			$lti_resource_link->scope_lineitem_read_only("");
+			$lti_resource_link->scope_result_readonly("");
+			$lti_resource_link->scope_result_score("");
+		}
+
+		if($exists) {
+			$db->putLTIResourceLink($lti_resource_link);
+		} else {
+			$db->addLTIResourceLink($lti_resource_link);
 		}
 	}
-
-	$course_ref->{name} = $parser->getCourseName();
-	$course_ref->{title} = $r->param("context_title");
-	$course_ref->{id} = $r->param("resource_link_id");
-
-	return 0;
-}
-
-sub _getRoster
-{
-	my ($self, $xml) = @_;
-	my $r = $self->{r};
-
-	my $ua = LWP::UserAgent->new;
-	my $key = $r->param('oauth_consumer_key');
-	if (!defined($r->ce->{bridge}{lti_secrets}{$key}))
-	{
-		return error("Unknown secret key '$key', is there a typo?", "#e006");
-	}
-	my $request = Net::OAuth->request("request token")->new(
-		consumer_key => $key,
-		consumer_secret => $r->ce->{bridge}{lti_secrets}{$key},
-		protocol_version => Net::OAuth::PROTOCOL_VERSION_1_0A,
-		request_url => $r->param('ext_ims_lis_memberships_url'),
-		request_method => 'POST',
-		signature_method => 'HMAC-SHA1',
-		timestamp => time(),
-		nonce => rand(),
-		callback => 'about:blank',
-		extra_params => {
-			lti_version => 'LTI-1p0',
-			lti_message_type => 'basic-lis-readmembershipsforcontext',
-			id => $r->param('ext_ims_lis_memberships_id'),
-		}
-	);
-	$request->sign;
-
-	# remove the params in URL from post body so that they will not be sent twice
-	my @params = split('&', uri_unescape($request->to_post_body));
-	my $url = URI->new($request->request_url);
-	foreach my $k ($url->query_param) {
-		@params = grep {$_ ne $k.'='.$url->query_param($k)} @params;
-	}
-
-	# have to generate the post parameters ourselves because of the way blti building block check the hash (memberships_id)
-	my %p = map { (split('=', $_, 2))[0] => (split('=', $_, 2))[1] } @params;
-	# extra prod logging when debug is disabled
-	my $extralog = WebworkBridge::ExtraLog->new($r);
-	$extralog->logXML("--- " . $r->param('context_title') . " ---");
-	$extralog->logXML("LTI ID is " . $r->param('ext_ims_lis_memberships_id'));
-	$extralog->logXML("User role: " . $r->param('roles'));
-	# attempt actual request
-	my $res = $ua->request((POST $request->request_url, \%p));
-	if ($res->is_success)
-	{
-		$$xml = $res->content;
-		debug("LTI Get Roster Success! \n" . $$xml . "\n");
-		$extralog->logXML("Successfully retrieved roster: \n" . $$xml);
-		return 0;
-	}
-	else
-	{
-		$extralog->logXML("Roster retrival failed, unable to connect.");
-		return error("Unable to perform OAuth request.","#e007");
-	}
-}
-
-sub _verifyMessage()
-{
-	my $self = shift;
-	my $r = $self->{r};
-	# verify that the message hasn't been tampered with
-	my $ltiauthen = WeBWorK::Authen::LTI->new($r);
-	my $ret = $ltiauthen->authenticate();
-	if (!$ret)
-	{
-		return error("Error: LTI message integrity could not be verified. Check if the LTI launch URL has a trailing slash.","#e015");
-	}
-	return 0;
 }
 
 # Automatically add new users to course or update existing user information on launch.
@@ -637,56 +369,99 @@ sub _updateLaunchUser()
 	my $r = $self->{r};
 	my $ce = $r->ce;
 	my $db = $r->db;
-
-	if (defined($r->param('ubc_auto_update'))) {
-		# skip _updateLaunchUser if automatic update
-		debug("Skip updating Launch user for automatic update.");
-		return;
-	}
+	my $parser = $self->{parser};
+	my $deployment_id = $parser->get_claim("deployment_id");
 
 	debug("Parsing user information.");
-
 	# parse user from launch request
-	my $parser = WebworkBridge::Bridges::LTIParser->new($r);
-	my %user = $parser->parseLaunchUser();
+	my %user = $parser->get_user_info();
 
 	debug(Dumper(\%user));
 
-	my $course = ();
-	$course->{name} = $ce->{"courseName"};
-	my $updater = WebworkBridge::Importer::CourseUpdater->new($r, $course, "");
-
+	my $updater = WebworkBridge::Importer::CourseUpdater->new($ce, $db, '');
 	# check if user exists
 	if ($db->existsUser($user{'loginid'})) {
 		debug("Attempt to update user & assign assignments.");
 		my $oldUser = $db->getUser($user{'loginid'});
 		my $oldPermission = $db->getPermissionLevel($user{'loginid'});
-		$updater->updateUser($oldUser, \%user, $oldPermission, $db);
+		$updater->updateUser($oldUser, \%user, $oldPermission);
+
 		# assign all visible homeworks to students
 		if ($oldPermission->permission() <= $ce->{userRoles}{student}) {
 			$updater->assignAllVisibleSetsToUser($user{'loginid'}, $db);
 		}
-	}
-	else {
+	} else {
 		debug("Attempt to create user & assign assignments.");
-		$updater->addUser(\%user, $db, "");
+		$updater->addUser(\%user);
 	}
 
-	# update user homework set lis_source_did if quiz or homework set
-	if (($self->getHomeworkSet() || $self->getQuizSet()))
-	{
-		debug("Setting lis_source_did for user homeworkset context");
-		my $setId = $self->getHomeworkSet() ? $self->getHomeworkSet() : $self->getQuizSet();
+	debug("Done.");
+}
 
-		if ($db->existsUserSet($user{'loginid'}, $setId))
-		{
-			my $userSet = $db->getUserSet($user{'loginid'}, $setId);
-			$userSet->lis_source_did($r->param('lis_result_sourcedid'));
-			$db->putUserSet($userSet);
+# Automatically add new users to course or update existing user information on launch.
+# assign users to all the available assignments.
+sub _updateClassRoster()
+{
+	my $self = shift;
+	my $r = $self->{r};
+	my $ce = $r->ce;
+	my $db = $r->db;
+	my $parser = $self->{parser};
+
+	debug("Update class roster if available.");
+
+	# try to update course enrolment
+	if ($parser->get_nrps_claim()) {
+		my $names_and_roles_service = WeBWorK::Authen::LTIAdvantage::NamesAndRoleService->new($ce, $db);
+		my $membership = $names_and_roles_service->getAllNamesAndRole();
+		unless ($membership) {
+			debug("There was an issue fetching the class roster. ".$names_and_roles_service->{error});
+			return error("There was an issue fetching the class roster. ".$names_and_roles_service->{error}, "#e016");
+		}
+		my $ret = $self->SUPER::updateCourse($ce, $db, $membership);
+		if ($ret) {
+			return error("Update Class Roster failed: $ret", "#e010");
 		}
 	}
 
 	debug("Done.");
+}
+
+sub _updateClassGrades()
+{
+	my $self = shift;
+	my $r = $self->{r};
+	my $ce = $r->ce;
+	my $db = $r->db;
+	my $parser = $self->{parser};
+
+	debug("Update class assignment grades.");
+
+	# try to update course enrolment
+	if ($parser->get_ags_claim()) {
+		my $assignment_and_grade_service = WeBWorK::Authen::LTIAdvantage::AssignmentAndGradeService->new($ce, $db);
+		my $ret = $assignment_and_grade_service->pushAllAssignmentGrades();
+		if ($ret) {
+			debug("There was an issue fetching updating class grades. ".$assignment_and_grade_service->{error});
+			return error("There was an issue fetching updating class grades. ".$assignment_and_grade_service->{error}, "#e017");
+		}
+	}
+
+	debug("Done.");
+}
+
+sub _verifyMessage()
+{
+	my $self = shift;
+	my $r = $self->{r};
+	# verify that the message hasn't been tampered with
+	my $ltiauthen = WeBWorK::Authen::LTIAdvantage->new($r);
+	my $ret = $ltiauthen->authenticate();
+	if (!$ret)
+	{
+		return error("Error: LTI message integrity could not be verified. Check if the LTI launch URL has a trailing slash.","#e015");
+	}
+	return 0;
 }
 
 1;

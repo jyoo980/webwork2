@@ -2290,13 +2290,13 @@ BEGIN {
 }
 
 sub existsLTIContext {
-	my ($self, $consumerKey, $contextID) = shift->checkArgs(\@_, qw/oauth_consumer_key context_id/);
-	return $self->{lti_contexts}->exists($consumerKey, $contextID);
+	my ($self, $deploymentID, $contextID) = shift->checkArgs(\@_, qw/deployment_id context_id/);
+	return $self->{lti_contexts}->exists($deploymentID, $contextID);
 }
 
 sub getLTIContext {
-	my ( $self, $consumerKey, $contextID) = shift->checkArgs(\@_, qw/oauth_consumer_key context_id/);
-	return ( $self->getLTIContexts([$consumerKey, $contextID]) )[0];
+	my ( $self, $deploymentID, $contextID) = shift->checkArgs(\@_, qw/deployment_id context_id/);
+	return ( $self->getLTIContexts([$deploymentID, $contextID]) )[0];
 }
 
 sub addLTIContext {
@@ -2323,7 +2323,7 @@ sub putLTIContext {
 }
 
 sub getLTIContexts {
-	my ($self, @toolContextIDs) = shift->checkArgsRefList(\@_, qw/oauth_consumer_key context_id/);
+	my ($self, @toolContextIDs) = shift->checkArgsRefList(\@_, qw/deployment_id context_id/);
 	return $self->{lti_contexts}->gets(@toolContextIDs);
 }
 
@@ -2337,6 +2337,135 @@ sub getAllLTIContextsByAutomaticUpdates {
 	my ($self, $automaticUpdates) = shift->checkArgs(\@_, qw/automaticUpdates/);
 	my $where = [automatic_updates_eq => $automaticUpdates];
 	return $self->{lti_contexts}->get_records_where($where);
+}
+
+
+
+################################################################################
+# lti_resource_link functions
+################################################################################
+# this database table is for linking lti resource links to course ids
+
+BEGIN {
+	*LTIResourceLink = gen_schema_accessor("lti_resource_link");
+	*newLTIResourceLink = gen_new("lti_resource_link");
+	*existsLTIResourceLinkWhere = gen_exists_where("lti_resource_link");
+	*getLTIResourceLinkWhere = gen_get_records_where("lti_resource_link");
+}
+
+sub existsLTIResourceLink {
+	my ($self, $deploymentID, $contextID, $resourceLinkID) = shift->checkArgs(\@_, qw/deployment_id context_id resource_link_id/);
+	return $self->{lti_resource_link}->exists($deploymentID, $contextID, $resourceLinkID);
+}
+
+sub getLTIResourceLink {
+	my ( $self, $deploymentID, $contextID, $resourceLinkID) = shift->checkArgs(\@_, qw/deployment_id context_id resource_link_id/);
+	return ( $self->getLTIResourceLinks([$deploymentID, $contextID, $resourceLinkID]) )[0];
+}
+
+sub addLTIResourceLink {
+	my ( $self, $LTIResourceLink ) = shift->checkArgs(\@_, qw/REC:lti_resource_link/);
+
+	eval {
+		return $self->{lti_resource_link}->add($LTIResourceLink);
+	};
+	if ( my $ex = caught WeBWorK::DB::Ex::RecordExists ) {
+		croak "addLTIResourceLink: lti_resource_link exists (perhaps you meant to use putLTIResourceLink?)";
+	} elsif ($@) {
+		die $@;
+	}
+}
+
+sub putLTIResourceLink {
+	my ($self, $LTIResourceLink) = shift->checkArgs(\@_, qw/REC:lti_resource_link/);
+	my $rows = $self->{lti_resource_link}->put($LTIResourceLink); # DBI returns 0E0 for 0.
+	if ($rows == 0) {
+		croak "putLTIResourceLink: lti_resource_link not found (perhaps you meant to use addLTIResourceLink?)";
+	} else {
+		return $rows;
+	}
+}
+
+sub getLTIResourceLinks {
+	my ($self, @toolResourceLinkIDs) = shift->checkArgsRefList(\@_, qw/deployment_id context_id resource_link_id/);
+	return $self->{lti_resource_link}->gets(@toolResourceLinkIDs);
+}
+
+sub getAllLTIResourceLinks {
+	my ( $self ) = shift->checkArgs(\@_);
+	return $self->{lti_resource_link}->get_records_where();
+}
+
+sub getLTIResourceLinksBydeploymentIDAndContextID {
+	my ($self, $deploymentID, $contextID) = shift->checkArgs(\@_, qw/deployment_id context_id/);
+	my $where = [deployment_id_and_context_id_eq => $deploymentID, $contextID];
+	return $self->{lti_resource_link}->get_records_where($where);
+}
+
+sub getLTIResourceLinksByHomeworkSet {
+	my ($self, $setID) = shift->checkArgs(\@_, qw/set_id/);
+	my $where = [set_id_eq => $setID];
+	return $self->{lti_resource_link}->get_records_where($where);
+}
+################################################################################
+# lti_user functions
+################################################################################
+# this database table is for linking lti resource links to course ids
+
+BEGIN {
+	*LTIUser= gen_schema_accessor("lti_user");
+	*newLTIUser = gen_new("lti_user");
+	*existsLTIUserWhere = gen_exists_where("lti_user");
+	*getLTIUserWhere = gen_get_records_where("lti_user");
+}
+
+sub existsLTIUser {
+	my ($self, $userID, $deploymentID) = shift->checkArgs(\@_, qw/user_id deployment_id/);
+	return $self->{lti_user}->exists($userID, $deploymentID);
+}
+
+sub getLTIUser {
+	my ( $self, $userID, $deploymentID) = shift->checkArgs(\@_, qw/user_id deployment_id/);
+	return ( $self->getLTIUsers([$userID, $deploymentID,]) )[0];
+}
+
+sub addLTIUser {
+	my ( $self, $LTIUser ) = shift->checkArgs(\@_, qw/REC:lti_user/);
+
+	eval {
+		return $self->{lti_user}->add($LTIUser);
+	};
+	if ( my $ex = caught WeBWorK::DB::Ex::RecordExists ) {
+		croak "addLTIUser: lti_user exists (perhaps you meant to use putLTIUser?)";
+	} elsif ($@) {
+		die $@;
+	}
+}
+
+sub putLTIUser {
+	my ($self, $LTIUser) = shift->checkArgs(\@_, qw/REC:lti_user/);
+	my $rows = $self->{lti_user}->put($LTIUser); # DBI returns 0E0 for 0.
+	if ($rows == 0) {
+		croak "putLTIUser: lti_user not found (perhaps you meant to use addLTIUser?)";
+	} else {
+		return $rows;
+	}
+}
+
+sub getLTIUsers {
+	my ($self, @LTIUserIDs) = shift->checkArgsRefList(\@_, qw/user_id deployment_id/);
+	return $self->{lti_user}->gets(@LTIUserIDs);
+}
+
+sub getAllLTIUsers {
+	my ( $self ) = shift->checkArgs(\@_);
+	return $self->{lti_user}->get_records_where();
+}
+
+sub getLTIUserByUserID {
+	my ($self, $userID) = shift->checkArgs(\@_, qw/user_id/);
+	my $where = [user_id_eq => $userID];
+	return $self->{lti_user}->get_records_where($where);
 }
 
 ################################################################################

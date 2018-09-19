@@ -15,16 +15,14 @@ use WeBWorK::Debug;
 use WeBWorK::Utils qw(runtime_use readFile cryptPassword);
 use WeBWorK::DB::Utils qw(initializeUserProblem);
 
-use WebworkBridge::Importer::Error;
-
 # Constructor
 sub new
 {
-	my ($class, $r, $course_ref, $users_ref) = @_;
+	my ($class, $ce, $db, $users) = @_;
 	my $self = {
-		r => $r,
-		course => $course_ref,
-		users => $users_ref
+		ce => $ce,
+		db => $db,
+		users => $users
 	};
 	bless $self, $class;
 	return $self;
@@ -35,14 +33,15 @@ sub new
 sub updateCourse
 {
 	my $self = shift;
-	my $r = $self->{r};
-	my $ce = $r->ce;
-	my $db = $r->db;
+	my $ce = $self->{ce};
+	my $db = $self->{db};
+
+	my $course_id = $ce->{courseName}; # the course we're updating
 
 	debug(("-" x 80) . "\n");
 	debug("Starting User Update");
+
 	# Perform Setup
-	my $courseid = $self->{course}->{name}; # the course we're updating
 	my @users = @{$self->{users}}; # deref pointer
 
 	# Get already existing users in the database
@@ -57,7 +56,7 @@ sub updateCourse
 	};
 	if ($@)
 	{
-		return "Unable to list existing users for course: $courseid\n"
+		return "Unable to list existing users for course: $course_id\n"
 	}
 	my %perms = map {($_->user_id => $_ )} @permsList;
 	my %userList = map {($_->user_id => $_ )} @usersList;
@@ -79,11 +78,11 @@ sub updateCourse
 	}
 
 	my $numLTI = @users;
-	my $sum = " -- Course $courseid currently has $numCurAct people active, " .
+	my $sum = " -- Course $course_id currently has $numCurAct people active, " .
 		"$numCurDrop people dropped, we received $numLTI people from LTI.";
 	$self->addlog($sum);
 
-	# Update has 3 components
+	# Update has 4 components
 	#	1. Check existing users to see if we have anyone who dropped the course
 	#		but decided to re-register or if their info needs updating.
 	#	2. Add newly enrolled users
@@ -96,13 +95,13 @@ sub updateCourse
 		my $id = $_->{'loginid'};
 		if (exists($userList{$id}))
 		{ # Update component 1: Update existing users
-			$self->updateUser($userList{$id}, $_, $perms{$id}, $db);
+			$self->updateUser($userList{$id}, $_, $perms{$id});
 			delete($userList{$id}); # this user is now safe from being dropped
 		}
 		else
 		{ # Update component 2: newly enrolled user, have to add
-			my $ret = $self->addUser($_, $db);
-			$self->addlog("User $id joined $courseid");
+			my $ret = $self->addUser($_);
+			$self->addlog("User $id joined $course_id");
 			if ($ret)
 			{
 				return $ret;
@@ -123,16 +122,15 @@ sub updateCourse
 			$db->putUser($person);
 			if ($perms{$key}->permission() == $ce->{userRoles}{student})
 			{
-				$self->addlog("Student $key dropped $courseid");
+				$self->addlog("Student $key dropped $course_id");
 			}
 			else
 			{
-				$self->addlog("Teaching staff $key dropped $courseid");
+				$self->addlog("Teaching staff $key dropped $course_id");
 			}
 			#$db->deleteUser($key); # uncomment to actually delete user
 		}
 	}
-
 
 	debug("User Update Finished!\n");
 	debug(("-" x 80) . "\n");
@@ -144,9 +142,11 @@ sub updateUser
 {
 	# permission is the current permission object, which can be updated
 	# if $newInfo contains new permission
-	my ($self, $oldInfo, $newInfo, $permission, $db) = @_;
-	my $ce = $self->{r}->ce;
-	my $courseid = $self->{course}->{name}; # the course we're updating
+	my ($self, $oldInfo, $newInfo, $permission) = @_;
+	my $ce = $self->{ce};
+	my $db = $self->{db};
+
+	my $course_id = $ce->{courseName}; # the course we're updating
 	my $id = $oldInfo->user_id();
 
 	# Do the simple updates first since they can be batched
@@ -179,19 +179,6 @@ sub updateUser
 		$oldInfo->last_name($newInfo->{'lastname'});
 		$update = 1;
 	}
-	# lis_source_did (only if $newInfo set it)
-	if (defined($newInfo->{'lis_source_did'}) &&
-		$newInfo->{'lis_source_did'} ne $oldInfo->lis_source_did())
-	{
-		$oldInfo->lis_source_did($newInfo->{'lis_source_did'});
-		$update = 1;
-	} elsif (defined($newInfo->{'homework_set_lis_source_did'}) &&
-		$newInfo->{'homework_set_lis_source_did'} eq $oldInfo->lis_source_did())
-	{
-		# lis_source_did is now used for a homework set, set user's lis_source_did to NULL
-		$oldInfo->lis_source_did("");
-		$update = 1;
-	}
 	# Batch update info
 	if ($update)
 	{
@@ -210,7 +197,7 @@ sub updateUser
 		{
 			$oldInfo->status("C");
 			$db->putUser($oldInfo);
-			$self->addlog("Student $id rejoined $courseid");
+			$self->addlog("Student $id rejoined $course_id");
 			# assign all visible homeworks to user
 			$self->assignAllVisibleSetsToUser($id, $db);
 		}
@@ -218,15 +205,22 @@ sub updateUser
 		{
 			$oldInfo->status("P");
 			$db->putUser($oldInfo);
-			$self->addlog("Teaching staff $id rejoined $courseid");
+			$self->addlog("Teaching staff $id rejoined $course_id");
 		}
 	}
+
+	if (defined($newInfo->{'deployment_id'}) && defined($newInfo->{'lti_user_id'}) ) {
+		$self->addOrUpdateLTIUser($newInfo);
+	}
+
+	return 0;
 }
 
 sub addUser
 {
-	my ($self, $new_user_info, $db) = @_;
-	my $ce = $self->{r}->ce;
+	my ($self, $new_user_info) = @_;
+	my $ce = $self->{ce};
+	my $db = $self->{db};
 	my $id = $new_user_info->{'loginid'};
 	my $status = "C"; # defaults to enroled
 	my $role = $ce->{userRoles}{student}; # defaults to student
@@ -236,8 +230,10 @@ sub addUser
 	{ # override default permission if necessary
 		$role = $new_user_info->{'permission'};
 	}
+
 	if ($role == $ce->{userRoles}{professor} ||
-		$role == $ce->{userRoles}{ta})
+		$role == $ce->{userRoles}{ta} ||
+		$role == $ce->{userRoles}{admin})
 	{
 		$status = "P"; # teaching staff status, doesn't get homework or graded
 	}
@@ -250,7 +246,6 @@ sub addUser
 	$new_user->email_address($new_user_info->{'email'});
 	$new_user->status($status);
 	$new_user->student_id($new_user_info->{'studentid'});
-	$new_user->lis_source_did($new_user_info->{'lis_source_did'});
 
 	# password record
 	my $genpass = App::Genpass->new(length=>16);
@@ -258,8 +253,7 @@ sub addUser
 	$password->password(cryptPassword($genpass->generate));
 
 	# permission record
-	my $permission = $db->newPermissionLevel(user_id => $id,
-		permission => $role);
+	my $permission = $db->newPermissionLevel(user_id => $id, permission => $role);
 
 	# commit changes to db
 	eval{ $db->addUser($new_user); };
@@ -283,6 +277,39 @@ sub addUser
 		# assign all visible homeworks to user
 		$self->assignAllVisibleSetsToUser($id, $db);
 	}
+
+	if (defined($new_user_info->{'deployment_id'}) && defined($new_user_info->{'lti_user_id'}) ) {
+		$self->addOrUpdateLTIUser($new_user_info);
+	}
+
+	return 0;
+}
+
+sub addOrUpdateLTIUser
+{
+	my ($self, $user) = @_;
+	my $ce = $self->{ce};
+	my $db = $self->{db};
+	my $deployment_id = $user->{'deployment_id'};
+	my $user_id = $user->{'loginid'};
+	my $lti_user_id = $user->{'lti_user_id'};
+
+	my $exists = $db->existsLTIUser($user_id, $deployment_id);
+	if($exists) {
+        my $lti_user = $db->getLTIUser($user_id, $deployment_id);
+		if (defined($lti_user_id) && $lti_user_id ne $lti_user->lti_user_id()) {
+			$lti_user->lti_user_id($lti_user_id);
+			$db->putLTIUser($lti_user);
+		}
+    } else {
+        my $lti_user = $db->newLTIUser(
+			deployment_id => $deployment_id,
+			user_id => $user_id,
+			lti_user_id => $lti_user_id,
+		);
+        $db->addLTIUser($lti_user);
+	}
+
 	return 0;
 }
 
@@ -295,7 +322,7 @@ sub addlog
 
 	$msg = "[$date] $msg\n";
 
-	my $logfile = $self->{r}->ce->{bridge}{studentlog};
+	my $logfile = $self->{ce}->{bridge}{studentlog};
 	if ($logfile ne "")
 	{
 		if (open my $f, ">>", $logfile)
